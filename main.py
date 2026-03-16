@@ -120,7 +120,7 @@ def main() -> None:
                             print(f"{color}🚨 [DETECTION - {result['severity']}]{reset}")
                             print(f"   PID: {p.get('pid')} | Score: {score}")
                             print(f"   Matches: {match_list}")
-                            print(f"   Command: {p.get('cmdline')[:100]}")
+                            print(f"   Command: {(p.get('cmdline') or '')[:100]}")
                             print()
 
                 time.sleep(max(0.0, args.burst_sleep))

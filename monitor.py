@@ -1,4 +1,5 @@
-"""Process monitoring using psutil.
+"""
+Process monitoring using psutil.
 
 Provides ProcessMonitor class that tracks newly spawned processes
 by maintaining a set of seen PIDs and returning only new ones on each scan.
@@ -12,7 +13,7 @@ class ProcessMonitor:
     """Scans running processes and yields only newly seen PIDs."""
 
     def __init__(self) -> None:
-        self.seen: Set[int] = set()
+        self.seen: Set[int] = set() # Set of seen PIDs to track new processes
 
     def scan(self) -> List[Dict]:
         """Return list of new process info dicts discovered since last scan."""

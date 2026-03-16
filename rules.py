@@ -1,4 +1,5 @@
-"""Suspicious pattern detection with risk scoring.
+"""
+Suspicious pattern detection with risk scoring.
 
 Defines platform-specific suspicious keywords (Windows, Unix/Linux/macOS)
 with associated risk scores. Provides functions to match patterns against
@@ -62,7 +63,7 @@ def get_suspicious_keywords() -> List[Tuple[str, int]]:
     
     if system == "windows":
         return WINDOWS_SUSPICIOUS + COMMON_SUSPICIOUS
-    elif system in ("darwin", "linux"):
+    elif system in ("darwin", "linux"): # darwin = macOS
         return UNIX_SUSPICIOUS + COMMON_SUSPICIOUS
     else:
         # Fallback: combine all
@@ -70,7 +71,6 @@ def get_suspicious_keywords() -> List[Tuple[str, int]]:
 
 
 def calculate_severity(total_score: int) -> str:
-    """Convert total risk score to severity level."""
     if total_score >= 100:
         return "CRITICAL"
     elif total_score >= 70:
@@ -109,7 +109,7 @@ def find_suspicious(texts: Iterable[str]) -> Dict:
     
     total_score = sum(found.values())
     severity = calculate_severity(total_score)
-    matches = [(k, v) for k, v in sorted(found.items(), key=lambda x: x[1], reverse=True)]
+    matches = [(k, v) for k, v in sorted(found.items(), key=lambda x: x[1], reverse=True)] # Patternleri risk skorlarına göre azalan sırayla sıralar.
     
     return {
         "matches": matches,

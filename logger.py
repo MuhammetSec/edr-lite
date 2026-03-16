@@ -1,4 +1,5 @@
-"""JSONL logging utilities.
+"""
+JSONL logging utilities.
 
 Provides functions to write Python objects as JSON Lines to files,
 with automatic directory creation. Includes a helper to read the last N lines
