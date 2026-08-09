@@ -1,24 +1,32 @@
-"""
-Process monitoring using psutil.
+"""Process monitoring using psutil.
 
-Provides ProcessMonitor class that tracks newly spawned processes
-by maintaining a set of seen PIDs and returning only new ones on each scan.
+Provides ProcessMonitor, which tracks newly spawned processes and returns only
+the ones it has not reported before.
 """
 
 import psutil
-from typing import Dict, List, Set
+from typing import Dict, List, Set, Tuple
+
+# A process is identified by (pid, create_time) rather than pid alone. The OS
+# recycles PIDs, so a bare int key would silently treat a brand new process as
+# already-seen once its number came back around.
+ProcessKey = Tuple[int, float]
 
 
 class ProcessMonitor:
-    """Scans running processes and yields only newly seen PIDs."""
+    """Scans running processes and yields only newly seen ones."""
 
     def __init__(self) -> None:
-        self.seen: Set[int] = set() # Set of seen PIDs to track new processes
+        self.seen: Set[ProcessKey] = set()
 
     def scan(self) -> List[Dict]:
         """Return list of new process info dicts discovered since last scan."""
         new = []
-        for proc in psutil.process_iter(["pid", "name", "exe", "cmdline", "create_time", "username"]):
+        alive: Set[ProcessKey] = set()
+
+        for proc in psutil.process_iter(
+            ["pid", "name", "exe", "cmdline", "create_time", "username"]
+        ):
             try:
                 info = proc.info
             except (psutil.NoSuchProcess, psutil.AccessDenied):
@@ -27,10 +35,11 @@ class ProcessMonitor:
             pid = info.get("pid")
             if pid is None:
                 continue
-            if pid in self.seen:
-                continue
 
-            self.seen.add(pid)
+            key: ProcessKey = (pid, info.get("create_time") or 0.0)
+            alive.add(key)
+            if key in self.seen:
+                continue
 
             # normalize cmdline to a single string for logging/rules
             cmdline = info.get("cmdline") or []
@@ -50,4 +59,8 @@ class ProcessMonitor:
                 }
             )
 
+        # Forget processes that have exited. Tracking stays in memory only, but
+        # pruning keeps the set bounded during long runs instead of growing
+        # once per process the host has ever started.
+        self.seen = alive
         return new

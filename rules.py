@@ -1,19 +1,33 @@
-"""
-Suspicious pattern detection with risk scoring.
+"""Suspicious pattern detection with risk scoring.
 
-Defines platform-specific suspicious keywords (Windows, Unix/Linux/macOS)
-with associated risk scores. Provides functions to match patterns against
-process command lines and calculate severity levels (CRITICAL/HIGH/MEDIUM/LOW).
+Defines platform-specific suspicious patterns (Windows, Unix/Linux/macOS) with
+associated risk scores, matches them against process command lines, and derives
+a severity level (CRITICAL/HIGH/MEDIUM/LOW).
+
+Patterns fall into two classes:
+
+``INDICATORS``
+    Tools and techniques that are meaningful on their own (``powershell``,
+    ``base64 -d``, ``/dev/tcp``). At least one indicator must match before
+    anything is reported.
+
+``MODIFIERS``
+    Shell chaining punctuation and URL tokens (``|``, ``;``, ``http://``).
+    These occur in a large share of perfectly ordinary command lines, so they
+    only contribute score once an indicator has already matched. Scoring them
+    standalone is what made a browser's ``--features=A|B`` flag look like a
+    threat.
 """
 
 import platform
-from typing import Iterable, List, Dict, Tuple
+import re
+from typing import Dict, Iterable, List, Optional, Tuple
 
 # Risk scores: CRITICAL=100, HIGH=70, MEDIUM=40, LOW=20
 # Pattern format: (pattern, risk_score)
 
-# Platform-specific suspicious keywords with risk scores
-WINDOWS_SUSPICIOUS: List[Tuple[str, int]] = [
+# Platform-specific indicators with risk scores
+WINDOWS_INDICATORS: List[Tuple[str, int]] = [
     ("-enc", 100),  # Encoded command - highly suspicious
     ("-encodedcommand", 100),
     ("powershell", 70),
@@ -29,7 +43,7 @@ WINDOWS_SUSPICIOUS: List[Tuple[str, int]] = [
     ("cscript", 50),
 ]
 
-UNIX_SUSPICIOUS: List[Tuple[str, int]] = [
+UNIX_INDICATORS: List[Tuple[str, int]] = [
     ("/dev/tcp", 90),  # Direct TCP connection - very suspicious
     ("base64 -d", 80),  # Decoding - often malicious
     ("bash -c", 60),
@@ -45,8 +59,8 @@ UNIX_SUSPICIOUS: List[Tuple[str, int]] = [
     ("wget", 25),  # Lower - often legitimate
 ]
 
-# Common suspicious patterns for all platforms
-COMMON_SUSPICIOUS: List[Tuple[str, int]] = [
+# Context amplifiers. Never reported on their own - see module docstring.
+MODIFIERS: List[Tuple[str, int]] = [
     ("download", 45),
     ("http://", 35),
     ("https://", 25),
@@ -56,21 +70,37 @@ COMMON_SUSPICIOUS: List[Tuple[str, int]] = [
     (";", 15),
 ]
 
+_WORD = re.compile(r"\w")
 
-def get_suspicious_keywords() -> List[Tuple[str, int]]:
-    """Return platform-specific suspicious keywords with risk scores."""
-    system = platform.system().lower()
-    
-    if system == "windows":
-        return WINDOWS_SUSPICIOUS + COMMON_SUSPICIOUS
-    elif system in ("darwin", "linux"): # darwin = macOS
-        return UNIX_SUSPICIOUS + COMMON_SUSPICIOUS
+
+def get_rule_sets(
+    system: Optional[str] = None,
+) -> Tuple[List[Tuple[str, int]], List[Tuple[str, int]]]:
+    """Return ``(indicators, modifiers)`` for `system` (default: this host).
+
+    `system` accepts the same values as ``platform.system()``; note that macOS
+    reports ``"Darwin"``. Unknown platforms fall back to every indicator.
+    """
+    name = (system or platform.system()).lower()
+
+    if name == "windows":
+        indicators = WINDOWS_INDICATORS
+    elif name in ("darwin", "linux"):  # darwin = macOS
+        indicators = UNIX_INDICATORS
     else:
-        # Fallback: combine all
-        return WINDOWS_SUSPICIOUS + UNIX_SUSPICIOUS + COMMON_SUSPICIOUS
+        indicators = WINDOWS_INDICATORS + UNIX_INDICATORS
+
+    return indicators, MODIFIERS
+
+
+def get_suspicious_keywords(system: Optional[str] = None) -> List[Tuple[str, int]]:
+    """Return every pattern in play for `system`, indicators first."""
+    indicators, modifiers = get_rule_sets(system)
+    return indicators + modifiers
 
 
 def calculate_severity(total_score: int) -> str:
+    """Convert a total risk score into a severity label."""
     if total_score >= 100:
         return "CRITICAL"
     elif total_score >= 70:
@@ -81,38 +111,85 @@ def calculate_severity(total_score: int) -> str:
         return "LOW"
 
 
-def find_suspicious(texts: Iterable[str]) -> Dict:
+def _matches_word_bounded(text: str, pattern: str) -> bool:
+    """Return True if `pattern` occurs in `text` outside of a longer word.
+
+    ``curl`` should fire on ``curl http://x`` but not on ``/usr/lib/libcurl.dylib``.
+    Only alphanumeric pattern edges are boundary-checked; a pattern that starts
+    or ends with punctuation (``-enc``, ``/dev/tcp``, ``|``) keeps plain
+    substring semantics on that side, since there is no word to be buried in.
+    """
+    start = 0
+    while True:
+        i = text.find(pattern, start)
+        if i == -1:
+            return False
+        end = i + len(pattern)
+        head_ok = not (pattern[0].isalnum() and i > 0 and _WORD.match(text[i - 1]))
+        tail_ok = not (
+            pattern[-1].isalnum() and end < len(text) and _WORD.match(text[end])
+        )
+        if head_ok and tail_ok:
+            return True
+        start = i + 1
+
+
+def _collect(patterns: List[Tuple[str, int]], texts: List[str]) -> Dict[str, int]:
+    """Return ``{pattern: score}`` for every pattern matching any of `texts`."""
+    found: Dict[str, int] = {}
+    for pattern, score in patterns:
+        lowered_pattern = pattern.lower()
+        for text in texts:
+            if _matches_word_bounded(text, lowered_pattern):
+                # Keep the highest score if a pattern is listed more than once
+                if found.get(pattern, -1) < score:
+                    found[pattern] = score
+                break
+    return found
+
+
+def _drop_subsumed(found: Dict[str, int]) -> Dict[str, int]:
+    """Drop patterns that are substrings of another matched pattern.
+
+    ``bash -c`` already implies ``sh -c`` and ``-encodedcommand`` implies
+    ``-enc``. Scoring both counts a single technique twice, which is what
+    inflated one shell invocation to 120 points.
+    """
+    return {
+        pattern: score
+        for pattern, score in found.items()
+        if not any(pattern != other and pattern in other for other in found)
+    }
+
+
+def find_suspicious(texts: Iterable[str], system: Optional[str] = None) -> Dict:
     """Return matched suspicious patterns with risk scores.
+
+    Returns a detection only when at least one indicator matched; modifiers
+    alone are treated as noise.
 
     Returns:
         {
-            "matches": [(pattern, score), ...],
+            "matches": [(pattern, score), ...],   # highest score first
             "total_score": int,
-            "severity": "CRITICAL"|"HIGH"|"MEDIUM"|"LOW"
+            "severity": "CRITICAL"|"HIGH"|"MEDIUM"|"LOW"|"INFO"
         }
     """
-    keywords = get_suspicious_keywords()
-    found = {}  # pattern -> score
+    indicators, modifiers = get_rule_sets(system)
     lowered = [t.lower() for t in texts if t]
-    
-    for pattern, score in keywords:
-        pattern_lower = pattern.lower()
-        for t in lowered:
-            if pattern_lower in t:
-                # Take highest score if pattern matches multiple times
-                if pattern not in found or found[pattern] < score:
-                    found[pattern] = score
-                break
-    
-    if not found:
+
+    anchored = _collect(indicators, lowered)
+    if not anchored:
         return {"matches": [], "total_score": 0, "severity": "INFO"}
-    
+
+    found = _drop_subsumed({**anchored, **_collect(modifiers, lowered)})
+
     total_score = sum(found.values())
-    severity = calculate_severity(total_score)
-    matches = [(k, v) for k, v in sorted(found.items(), key=lambda x: x[1], reverse=True)] # Patternleri risk skorlarına göre azalan sırayla sıralar.
-    
+    # Stable sort: equal scores keep rule-declaration order.
+    matches = sorted(found.items(), key=lambda item: item[1], reverse=True)
+
     return {
         "matches": matches,
         "total_score": total_score,
-        "severity": severity
+        "severity": calculate_severity(total_score),
     }
