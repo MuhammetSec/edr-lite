@@ -10,7 +10,8 @@
 
 A small endpoint-telemetry tool: it watches for newly spawned processes, scores
 their command lines against a suspicious-pattern ruleset, and routes findings by
-severity. Roughly 600 lines of Python with one dependency (`psutil`).
+severity. About 700 lines of Python plus a test suite, with one runtime
+dependency (`psutil`).
 
 It is a learning project, not a product — there is no kernel driver, no agent
 infrastructure, and no response capability. What it does implement end to end is
@@ -360,7 +361,8 @@ MIT — see [LICENSE](LICENSE).
 
 Küçük bir uç nokta telemetri aracı: yeni başlayan süreçleri izler, komut
 satırlarını şüpheli örüntü kural setine karşı puanlar ve bulguları önem düzeyine
-göre yönlendirir. Tek bağımlılıkla (`psutil`) yaklaşık 600 satır Python.
+göre yönlendirir. Yaklaşık 700 satır Python ve bir test paketi; tek çalışma
+zamanı bağımlılığı `psutil`.
 
 Bu bir öğrenme projesi, ürün değil — kernel sürücüsü, ajan altyapısı veya
 müdahale yeteneği yok. Uçtan uca uyguladığı şey beni asıl ilgilendiren kısım:
